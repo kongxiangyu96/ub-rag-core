@@ -31,14 +31,18 @@ flowchart TD
 ```text
 ub-rag-core/
 ├── pyproject.toml
-├── Dockerfile
-├── docker-compose.yml          # 本地: app + pgvector
+├── Dockerfile                  # 多阶段构建（builder + runtime），非 root 运行
+├── docker-compose.yml          # 本地: app + pgvector，全部变量从 .env 注入
+├── docker-compose.prod.yml     # 生产: 仅 app，连云 RDS，资源限制 + 回环端口
+├── .env.example                # 本地 / 通用变量模板
+├── .env.prod.example           # 生产环境变量模板
+├── Makefile                    # 一键命令（make help 查看全部）
 ├── alembic.ini
 ├── alembic/
 │   ├── env.py
 │   └── versions/0001_init.py
 ├── scripts/
-│   └── entrypoint.sh
+│   └── entrypoint.sh           # 等 DB → alembic upgrade → uvicorn
 ├── src/
 │   ├── main.py                 # FastAPI app, lifespan 加载模型/DB
 │   ├── config.py               # pydantic-settings
@@ -60,7 +64,16 @@ ub-rag-core/
 
 ## 三、快速开始（本地一键起）
 
-依赖：Docker + Docker Compose。首次构建会拉 PyTorch CPU + FlagEmbedding，耗时较久；首次启动还会从 HuggingFace 拉模型权重（~3GB），已配置 `HF_ENDPOINT=https://hf-mirror.com` 加速。
+依赖：Docker + Docker Compose v2。首次构建会拉 PyTorch CPU + FlagEmbedding，耗时较久；首次启动还会从 HuggingFace 拉模型权重（~3GB），已配置 `HF_ENDPOINT=https://hf-mirror.com` 加速。
+
+最简：
+
+```bash
+make up           # 自动创建 .env、构建镜像、起 db + app
+make logs         # 跟随 app 日志，等待 "embedder ready" / "reranker ready"
+```
+
+或者用原生命令：
 
 ```bash
 cp .env.example .env
@@ -93,12 +106,18 @@ curl -X POST http://localhost:8000/api/v1/search \
   -d '{"query": "RAG 是什么？", "top_k": 20, "rerank_top_k": 5}'
 ```
 
-清理：
+常用命令（更多见 `make help`）：
 
-```bash
-docker compose down            # 停服务
-docker compose down -v         # 连数据卷一起删（含模型缓存）
-```
+| 命令              | 说明                                          |
+| ----------------- | --------------------------------------------- |
+| `make up`         | 起完整本地 stack（app + pgvector）            |
+| `make logs`       | 跟随 app 日志                                 |
+| `make sh`         | 进 app 容器 shell                             |
+| `make psql`       | 用 psql 进 pgvector                           |
+| `make migrate`    | 手动跑 `alembic upgrade head`                 |
+| `make test`       | 在容器里跑 pytest                             |
+| `make down`       | 停服务（保留数据卷）                          |
+| `make clean`      | 停服务 + 删数据卷（含模型缓存，谨慎使用）     |
 
 ## 四、本地开发（不用 Docker）
 
@@ -193,7 +212,7 @@ uvicorn src.main:app --reload
 
 ## 七、阿里云部署
 
-适用于 ECS / SAE / ACK 容器形态。下面以最常见的 **ECS + RDS PostgreSQL** 为例。
+适用于 ECS / SAE / ACK 容器形态。下面以最常见的 **ECS + RDS PostgreSQL + ACR** 为例，给出"docker compose"和"docker run"两种方式。
 
 ### 1. 准备 RDS PostgreSQL
 
@@ -207,22 +226,61 @@ uvicorn src.main:app --reload
 
 ### 2. 构建并推送镜像到 ACR
 
+本机或 CI 上：
+
 ```bash
-# 在 ACR 控制台创建命名空间和仓库（例如 cn-hangzhou.aliyuncs.com/<ns>/ub-rag-core）
+# 在 ACR 控制台创建命名空间和仓库（例如 registry.cn-hangzhou.aliyuncs.com/<ns>/ub-rag-core）
 docker login --username=<ali_user> registry.cn-hangzhou.aliyuncs.com
+
+# Makefile 一键构建并推送（tag 默认取 git short-sha）
+make build-push \
+    IMAGE_NAME=registry.cn-hangzhou.aliyuncs.com/<ns>/ub-rag-core \
+    IMAGE_TAG=0.1.0
+```
+
+或裸命令：
+
+```bash
 docker build -t registry.cn-hangzhou.aliyuncs.com/<ns>/ub-rag-core:0.1.0 .
 docker push registry.cn-hangzhou.aliyuncs.com/<ns>/ub-rag-core:0.1.0
 ```
 
-### 3. 在 ECS 上运行
+### 3. 在 ECS 上部署（推荐：docker compose 生产配置）
+
+```bash
+# 一次性准备
+git clone <repo> /opt/ub-rag-core && cd /opt/ub-rag-core
+cp .env.prod.example .env.prod
+vim .env.prod                       # 填入 IMAGE_NAME / IMAGE_TAG / DATABASE_URL（指向 RDS）
+
+mkdir -p /data/ub-rag-core/model-cache   # 与 .env.prod 中 MODEL_CACHE_HOST_DIR 对齐
+
+# 登录 ACR
+docker login registry.cn-hangzhou.aliyuncs.com
+
+# 部署 / 升级
+make prod-up                        # 等价于：docker compose -f docker-compose.prod.yml --env-file .env.prod pull && up -d
+make prod-logs                      # 跟随日志直到 ready
+
+# 升级版本
+sed -i 's/^IMAGE_TAG=.*/IMAGE_TAG=0.2.0/' .env.prod
+make prod-up
+```
+
+`docker-compose.prod.yml` 默认把 8000 端口绑到 `127.0.0.1`，由前置 SLB / Nginx 代理出去；并配置了 4c/8G 的资源上限（按规格在 `.env.prod` 调）。模型缓存挂载到 `/data/ub-rag-core/model-cache`，重启秒级就绪。
+
+### 4. 在 ECS 上部署（最简：docker run）
+
+如果不想引入 compose，用单条 `docker run` 也行：
 
 ```bash
 docker pull registry.cn-hangzhou.aliyuncs.com/<ns>/ub-rag-core:0.1.0
 
 docker run -d --name ub-rag-core \
   --restart=always \
-  -p 8000:8000 \
-  -v /data/model-cache:/app/.model_cache \
+  -p 127.0.0.1:8000:8000 \
+  -v /data/ub-rag-core/model-cache:/app/.model_cache \
+  --memory=8g --cpus=4 \
   -e DATABASE_URL="postgresql+asyncpg://rag:<pwd>@pgm-xxx.pg.rds.aliyuncs.com:5432/rag" \
   -e MODEL_CACHE_DIR=/app/.model_cache \
   -e HF_ENDPOINT=https://hf-mirror.com \
@@ -232,16 +290,15 @@ docker run -d --name ub-rag-core \
   registry.cn-hangzhou.aliyuncs.com/<ns>/ub-rag-core:0.1.0
 ```
 
-挂载 `/data/model-cache`（首次启动后会缓存模型权重），后续重启秒级就绪。
+### 5. SAE / ACK 提示
 
-### 4. SAE / ACK 提示
+- **SAE**：直接使用上面的 ACR 镜像；环境变量参考 `.env.prod.example`；建议挂载 NAS 作为模型缓存盘；CPU 4c8g 起步（BGE-M3 + Reranker 内存约 5–6GB）。
+- **ACK**：以 Deployment 跑容器；模型缓存用 PVC；建议加 `livenessProbe`/`readinessProbe` 指向 `/health`，模型加载较慢可把 `initialDelaySeconds` 调到 120s。镜像本身已带 `HEALTHCHECK`，但 K8s 会忽略 Dockerfile 里的 healthcheck，所以仍需在 manifest 里配探针。
 
-- **SAE**：直接在「应用」里使用上面的 ACR 镜像；环境变量同上；建议挂载 NAS 作为模型缓存盘；CPU 4c8g 起步（BGE-M3 + Reranker 内存约 5–6GB）。
-- **ACK**：以 Deployment 跑容器；模型缓存用 PVC；建议加 `livenessProbe`/`readinessProbe` 指向 `/health`，模型加载较慢可把 `initialDelaySeconds` 调到 120s。
-
-### 5. 安全组 / VPC 提示
+### 6. 安全组 / VPC / 网关提示
 
 - ECS / SAE / ACK 与 RDS 必须在同一 VPC 或可达；RDS 白名单放通对应私网网段。
+- 镜像内置非 root 用户（uid=1000）和 `tini` 作为 PID 1，信号转发与僵尸回收已处理好。
 - 对外暴露 8000 端口前建议加 SLB / WAF / 鉴权层；本仓库未内置鉴权。
 
 ## 八、测试

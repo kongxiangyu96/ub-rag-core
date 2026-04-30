@@ -1,0 +1,58 @@
+# 生产环境独立 stack（不与 docker-compose.yml 合并，避免依赖较新的 !override 语法）。
+# 使用方式：
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod pull
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+#
+# 设计原则：
+# 1. 数据库走云上 RDS PostgreSQL（pgvector ≥ 0.5），所以这里不再启动本地 db
+# 2. 应用只 pull 已构建好的镜像（推荐 ACR），机器上不做构建
+# 3. 8000 端口只绑定到本机回环，由前置 SLB / Nginx / WAF 转发，避免直接暴露到公网
+# 4. 配置 CPU / 内存上下限，防止模型推理打爆宿主机
+# 5. 模型权重缓存挂宿主机目录，重启秒级就绪
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+services:
+  app:
+    image: ${IMAGE_NAME:?need IMAGE_NAME, e.g. registry.cn-hangzhou.aliyuncs.com/<ns>/ub-rag-core}:${IMAGE_TAG:?need IMAGE_TAG}
+    container_name: ${COMPOSE_PROJECT_NAME:-ub-rag-core}-app
+    restart: always
+    pull_policy: always
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?need DATABASE_URL pointing to RDS}
+      EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-BAAI/bge-m3}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
+      RERANKER_MODEL_NAME: ${RERANKER_MODEL_NAME:-BAAI/bge-reranker-v2-m3}
+      MODEL_CACHE_DIR: /app/.model_cache
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://hf-mirror.com}
+      DEVICE: ${DEVICE:-cpu}
+      USE_FP16: ${USE_FP16:-false}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      RUN_MIGRATIONS: ${RUN_MIGRATIONS:-true}
+      CHUNK_SIZE: ${CHUNK_SIZE:-512}
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-64}
+      DEFAULT_TOP_K: ${DEFAULT_TOP_K:-20}
+      DEFAULT_RERANK_TOP_K: ${DEFAULT_RERANK_TOP_K:-5}
+    ports:
+      - "127.0.0.1:${APP_PORT:-8000}:8000"
+    volumes:
+      - ${MODEL_CACHE_HOST_DIR:-/data/ub-rag-core/model-cache}:/app/.model_cache
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 180s
+    deploy:
+      resources:
+        limits:
+          cpus: "${APP_CPU_LIMIT:-4}"
+          memory: ${APP_MEM_LIMIT:-8g}
+        reservations:
+          cpus: "${APP_CPU_RESERVE:-2}"
+          memory: ${APP_MEM_RESERVE:-4g}
+    logging: *default-logging

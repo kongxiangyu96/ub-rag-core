@@ -1,47 +1,78 @@
+# Local / 自带 pgvector 的一键启动
+# 生产环境（RDS）请改用 docker-compose.prod.yml 覆盖：
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   db:
     image: pgvector/pgvector:pg16
-    container_name: ub-rag-core-db
+    container_name: ${COMPOSE_PROJECT_NAME:-ub-rag-core}-db
     restart: unless-stopped
     environment:
-      POSTGRES_USER: rag
-      POSTGRES_PASSWORD: rag
-      POSTGRES_DB: rag
+      POSTGRES_USER: ${POSTGRES_USER:-rag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rag}
+      POSTGRES_DB: ${POSTGRES_DB:-rag}
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U rag -d rag"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rag} -d ${POSTGRES_DB:-rag}"]
       interval: 5s
       timeout: 3s
       retries: 20
+    networks:
+      - rag-net
+    logging: *default-logging
 
   app:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: ub-rag-core-app
+    image: ${IMAGE_NAME:-ub-rag-core}:${IMAGE_TAG:-latest}
+    container_name: ${COMPOSE_PROJECT_NAME:-ub-rag-core}-app
     restart: unless-stopped
     depends_on:
       db:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql+asyncpg://rag:rag@db:5432/rag
-      EMBEDDING_MODEL_NAME: BAAI/bge-m3
-      EMBEDDING_DIM: 1024
-      RERANKER_MODEL_NAME: BAAI/bge-reranker-v2-m3
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://rag:rag@db:5432/rag}
+      EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-BAAI/bge-m3}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
+      RERANKER_MODEL_NAME: ${RERANKER_MODEL_NAME:-BAAI/bge-reranker-v2-m3}
       MODEL_CACHE_DIR: /app/.model_cache
-      HF_ENDPOINT: https://hf-mirror.com
-      DEVICE: cpu
-      USE_FP16: "false"
-      LOG_LEVEL: INFO
-      RUN_MIGRATIONS: "true"
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://hf-mirror.com}
+      DEVICE: ${DEVICE:-cpu}
+      USE_FP16: ${USE_FP16:-false}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      RUN_MIGRATIONS: ${RUN_MIGRATIONS:-true}
+      CHUNK_SIZE: ${CHUNK_SIZE:-512}
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-64}
+      DEFAULT_TOP_K: ${DEFAULT_TOP_K:-20}
+      DEFAULT_RERANK_TOP_K: ${DEFAULT_RERANK_TOP_K:-5}
     ports:
-      - "8000:8000"
+      - "${APP_PORT:-8000}:8000"
     volumes:
       - model-cache:/app/.model_cache
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 180s
+    networks:
+      - rag-net
+    logging: *default-logging
 
 volumes:
   pgdata:
   model-cache:
+
+networks:
+  rag-net:
+    driver: bridge
