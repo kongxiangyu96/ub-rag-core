@@ -1,0 +1,264 @@
+# ub-rag-core
+
+最小可执行 FastAPI RAG 后端：Markdown 入库 → Chunking → Embedding → pgvector → 向量召回 → Reranker → 返回 Top-K。
+
+- 框架：FastAPI + SQLAlchemy 2.0 (async) + Alembic
+- 向量库：PostgreSQL + [pgvector](https://github.com/pgvector/pgvector)
+- Embedding：`BAAI/bge-m3`（1024 维，中英多语）
+- Reranker：`BAAI/bge-reranker-v2-m3`
+- Chunking：基于 [`langchain-text-splitters`](https://pypi.org/project/langchain-text-splitters/) 的 Markdown 标题切分 + 滑窗切块（封装为独立 `ChunkingService`）
+
+---
+
+## 一、架构
+
+```mermaid
+flowchart TD
+    md[Markdown 输入] --> Ingest["POST /api/v1/documents"]
+    Ingest --> Chunk[ChunkingService]
+    Chunk --> Embed[BGEEmbedder.embed_documents]
+    Embed --> Store[(PostgreSQL + pgvector)]
+
+    Q[Query] --> Search["POST /api/v1/search"]
+    Search --> EmbedQ[BGEEmbedder.embed_query]
+    EmbedQ --> Recall["pgvector cosine top_k"]
+    Recall --> Rerank[BGEReranker]
+    Rerank --> Resp[返回 rerank_top_k]
+```
+
+## 二、目录结构
+
+```text
+ub-rag-core/
+├── pyproject.toml
+├── Dockerfile
+├── docker-compose.yml          # 本地: app + pgvector
+├── alembic.ini
+├── alembic/
+│   ├── env.py
+│   └── versions/0001_init.py
+├── scripts/
+│   └── entrypoint.sh
+├── src/
+│   ├── main.py                 # FastAPI app, lifespan 加载模型/DB
+│   ├── config.py               # pydantic-settings
+│   ├── api/
+│   │   ├── dependencies.py
+│   │   ├── schemas.py
+│   │   └── routes/{documents,search}.py
+│   ├── core/db.py              # async engine / session
+│   ├── models/document.py      # Document / Chunk ORM
+│   └── services/
+│       ├── chunking/           # 独立 service: 接口 + Markdown 实现 + 门面
+│       ├── embedding/bge.py
+│       ├── reranker/bge.py
+│       ├── vector_store/pgvector_store.py
+│       ├── ingestion.py        # 入库编排
+│       └── retrieval.py        # 检索编排
+└── tests/
+```
+
+## 三、快速开始（本地一键起）
+
+依赖：Docker + Docker Compose。首次构建会拉 PyTorch CPU + FlagEmbedding，耗时较久；首次启动还会从 HuggingFace 拉模型权重（~3GB），已配置 `HF_ENDPOINT=https://hf-mirror.com` 加速。
+
+```bash
+cp .env.example .env
+docker compose up -d --build
+docker compose logs -f app
+```
+
+服务起来后：
+
+- API 文档：http://localhost:8000/docs
+- 健康检查：http://localhost:8000/health
+
+入库一个 Markdown：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/documents \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "title": "RAG 简介",
+    "content": "# RAG 简介\n\n检索增强生成（Retrieval-Augmented Generation）是一种将外部知识库与 LLM 结合的范式。\n\n## 工作流程\n\n1. 文本切分\n2. 向量化\n3. 检索\n4. 重排\n5. 生成",
+    "metadata": {"tag": "demo"}
+  }'
+```
+
+检索：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "RAG 是什么？", "top_k": 20, "rerank_top_k": 5}'
+```
+
+清理：
+
+```bash
+docker compose down            # 停服务
+docker compose down -v         # 连数据卷一起删（含模型缓存）
+```
+
+## 四、本地开发（不用 Docker）
+
+需要本地有一个开了 pgvector 扩展的 PostgreSQL，或起一个临时容器：
+
+```bash
+docker run -d --name pgvector \
+  -e POSTGRES_USER=rag -e POSTGRES_PASSWORD=rag -e POSTGRES_DB=rag \
+  -p 5432:5432 pgvector/pgvector:pg16
+```
+
+然后：
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -e '.[dev]'
+# PyTorch CPU 单独装（避免拉 CUDA 包）：
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+cp .env.example .env
+alembic upgrade head
+uvicorn src.main:app --reload
+```
+
+## 五、API 概览
+
+| Method | Path                              | 说明 |
+|--------|-----------------------------------|------|
+| POST   | `/api/v1/documents`               | 入库一个 Markdown 文档（自动 chunk + embed + 存储） |
+| GET    | `/api/v1/documents/{id}`          | 读取文档元信息 + 全部 chunk |
+| DELETE | `/api/v1/documents/{id}`          | 级联删除文档与其 chunk |
+| POST   | `/api/v1/search`                  | 向量召回 + Reranker，返回 top-k |
+| GET    | `/health`                         | 检查 DB / 模型就绪状态 |
+
+### `POST /api/v1/documents`
+
+```json
+{
+  "title": "string",
+  "content": "markdown string",
+  "source": "optional string",
+  "metadata": { "any": "json" }
+}
+```
+
+返回：`{ "document_id": "...", "num_chunks": 7 }`
+
+### `POST /api/v1/search`
+
+```json
+{
+  "query": "string",
+  "top_k": 20,
+  "rerank_top_k": 5,
+  "filters": { "tag": "demo" }
+}
+```
+
+`filters` 走 `metadata @> filters` JSONB 包含匹配。返回：
+
+```json
+{
+  "query": "...",
+  "results": [
+    {
+      "chunk_id": "...",
+      "document_id": "...",
+      "content": "...",
+      "score": 0.91,
+      "recall_score": 0.78,
+      "metadata": { "h1": "RAG 简介" }
+    }
+  ]
+}
+```
+
+## 六、配置（.env）
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `DATABASE_URL` | `postgresql+asyncpg://rag:rag@localhost:5432/rag` | 必须用 `postgresql+asyncpg://` |
+| `EMBEDDING_MODEL_NAME` | `BAAI/bge-m3` | HF 模型名 |
+| `EMBEDDING_DIM` | `1024` | 与模型保持一致；改变需新建 schema |
+| `RERANKER_MODEL_NAME` | `BAAI/bge-reranker-v2-m3` | |
+| `MODEL_CACHE_DIR` | `.model_cache` | 模型权重缓存目录（建议挂卷） |
+| `HF_ENDPOINT` | — | 国内可设为 `https://hf-mirror.com` |
+| `DEVICE` | `cpu` | `cpu` 或 `cuda` |
+| `USE_FP16` | `false` | GPU 上启用 FP16 |
+| `CHUNK_SIZE` / `CHUNK_OVERLAP` | `512` / `64` | Markdown 分块参数 |
+| `DEFAULT_TOP_K` / `DEFAULT_RERANK_TOP_K` | `20` / `5` | 召回 / 重排数量 |
+| `RUN_MIGRATIONS` | `true` | 容器入口启动前是否自动 `alembic upgrade head` |
+
+## 七、阿里云部署
+
+适用于 ECS / SAE / ACK 容器形态。下面以最常见的 **ECS + RDS PostgreSQL** 为例。
+
+### 1. 准备 RDS PostgreSQL
+
+1. 在控制台创建 **RDS PostgreSQL 16**（或 ≥ 14，pgvector 要求 ≥ 12）实例。
+2. 创建账号 `rag` / 数据库 `rag`，记下内网域名（形如 `pgm-xxxxxxxx.pg.rds.aliyuncs.com`）。
+3. 在「数据库管理」中执行：
+   ```sql
+   CREATE EXTENSION IF NOT EXISTS vector;
+   ```
+4. 在「白名单」里加入 ECS 的内网网段。
+
+### 2. 构建并推送镜像到 ACR
+
+```bash
+# 在 ACR 控制台创建命名空间和仓库（例如 cn-hangzhou.aliyuncs.com/<ns>/ub-rag-core）
+docker login --username=<ali_user> registry.cn-hangzhou.aliyuncs.com
+docker build -t registry.cn-hangzhou.aliyuncs.com/<ns>/ub-rag-core:0.1.0 .
+docker push registry.cn-hangzhou.aliyuncs.com/<ns>/ub-rag-core:0.1.0
+```
+
+### 3. 在 ECS 上运行
+
+```bash
+docker pull registry.cn-hangzhou.aliyuncs.com/<ns>/ub-rag-core:0.1.0
+
+docker run -d --name ub-rag-core \
+  --restart=always \
+  -p 8000:8000 \
+  -v /data/model-cache:/app/.model_cache \
+  -e DATABASE_URL="postgresql+asyncpg://rag:<pwd>@pgm-xxx.pg.rds.aliyuncs.com:5432/rag" \
+  -e MODEL_CACHE_DIR=/app/.model_cache \
+  -e HF_ENDPOINT=https://hf-mirror.com \
+  -e DEVICE=cpu \
+  -e USE_FP16=false \
+  -e RUN_MIGRATIONS=true \
+  registry.cn-hangzhou.aliyuncs.com/<ns>/ub-rag-core:0.1.0
+```
+
+挂载 `/data/model-cache`（首次启动后会缓存模型权重），后续重启秒级就绪。
+
+### 4. SAE / ACK 提示
+
+- **SAE**：直接在「应用」里使用上面的 ACR 镜像；环境变量同上；建议挂载 NAS 作为模型缓存盘；CPU 4c8g 起步（BGE-M3 + Reranker 内存约 5–6GB）。
+- **ACK**：以 Deployment 跑容器；模型缓存用 PVC；建议加 `livenessProbe`/`readinessProbe` 指向 `/health`，模型加载较慢可把 `initialDelaySeconds` 调到 120s。
+
+### 5. 安全组 / VPC 提示
+
+- ECS / SAE / ACK 与 RDS 必须在同一 VPC 或可达；RDS 白名单放通对应私网网段。
+- 对外暴露 8000 端口前建议加 SLB / WAF / 鉴权层；本仓库未内置鉴权。
+
+## 八、测试
+
+仅本地无依赖单元测试（chunking / schemas）：
+
+```bash
+pip install -e '.[dev]'
+pytest -q
+```
+
+涉及 DB / 模型的集成测试可以在 `docker compose up` 之后通过 `curl` / `httpx` 实际打 API 验证。
+
+## 九、后续可扩展点
+
+- 替换 chunker：实现 `Chunker` Protocol 注入到 `ChunkingService`，无需改 ingestion / API。
+- 替换 embedder / reranker：实现 `Embedder` / `Reranker` Protocol，main lifespan 中替换即可。
+- 扩展为微服务：把 `services/chunking` 抽出为独立 FastAPI 进程，`ChunkingService` 改为 HTTP 客户端，调用方零改动。
+- 加 BM25 / hybrid search：在 `chunks` 上加 `tsvector` 列与 GIN 索引，retrieval 中融合两路得分再 rerank。
+- 加鉴权与多租户：在 `Document` 上加 `tenant_id`，`metadata @>` 过滤已自动支持。
