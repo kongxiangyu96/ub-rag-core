@@ -208,7 +208,25 @@ uvicorn src.main:app --reload
 | `USE_FP16` | `false` | GPU 上启用 FP16 |
 | `CHUNK_SIZE` / `CHUNK_OVERLAP` | `512` / `64` | Markdown 分块参数 |
 | `DEFAULT_TOP_K` / `DEFAULT_RERANK_TOP_K` | `20` / `5` | 召回 / 重排数量 |
-| `RUN_MIGRATIONS` | `true` | 容器入口启动前是否自动 `alembic upgrade head` |
+| `WORKERS` | `1` | uvicorn worker 数；每个 worker 各加载一份模型（5–6GB），增并发请优先横向扩多副本 |
+| `RUN_MIGRATIONS` | `false`（生产）/ `true`（本地 compose） | 业务容器启动前是否自动 `alembic upgrade head`；多副本必须设 `false`，迁移走单独的一次性容器 |
+
+### 镜像无状态特性
+
+业务容器是**无状态 worker**：
+
+- 持久化数据全部在外部 PostgreSQL，容器内不写任何业务文件
+- `app.state` 上的 embedder / reranker 是只读模型对象，不算业务状态
+- `/app/.model_cache` 是只读模型权重缓存，丢了重新下载即可（不影响业务），多副本可共享 NAS / PVC（ReadOnly）
+- 可以放心横向扩展（k8s replicas、多机部署、SAE 多实例）
+
+**启动副作用清单**（部署时需要规划）：
+
+| 副作用 | 何时发生 | 多副本下的处理 |
+| --- | --- | --- |
+| 等待 DB 可达 | 每次启动 | 无影响，每个副本各自等 |
+| 拉模型权重 | 缓存目录为空时 | 共享 NAS / 各自拉都行 |
+| `alembic upgrade head` | `RUN_MIGRATIONS=true` 时 | **生产必须关掉**，由部署流水线用一次性容器跑 |
 
 ## 七、阿里云部署
 
@@ -247,6 +265,8 @@ docker push registry.cn-hangzhou.aliyuncs.com/<ns>/ub-rag-core:0.1.0
 
 ### 3. 在 ECS 上部署（推荐：docker compose 生产配置）
 
+业务容器无状态 + 默认 `RUN_MIGRATIONS=false`，标准部署是 **pull → 一次性容器迁移 → 起业务容器** 三步。
+
 ```bash
 # 一次性准备
 git clone <repo> /opt/ub-rag-core && cd /opt/ub-rag-core
@@ -258,42 +278,70 @@ mkdir -p /data/ub-rag-core/model-cache   # 与 .env.prod 中 MODEL_CACHE_HOST_DI
 # 登录 ACR
 docker login registry.cn-hangzhou.aliyuncs.com
 
-# 部署 / 升级
-make prod-up                        # 等价于：docker compose -f docker-compose.prod.yml --env-file .env.prod pull && up -d
+# 一键部署（pull + migrate + up）
+make prod-deploy
 make prod-logs                      # 跟随日志直到 ready
+```
 
-# 升级版本
+或者拆开手动跑：
+
+```bash
+make prod-pull                      # 拉新镜像
+make prod-migrate                   # 起一次性容器跑 alembic upgrade head 后退出
+make prod-up                        # 起业务容器（不会再跑迁移）
+```
+
+升级版本：
+
+```bash
 sed -i 's/^IMAGE_TAG=.*/IMAGE_TAG=0.2.0/' .env.prod
-make prod-up
+make prod-deploy                    # pull 新版 → migrate（如有新迁移）→ 滚动起 app
 ```
 
 `docker-compose.prod.yml` 默认把 8000 端口绑到 `127.0.0.1`，由前置 SLB / Nginx 代理出去；并配置了 4c/8G 的资源上限（按规格在 `.env.prod` 调）。模型缓存挂载到 `/data/ub-rag-core/model-cache`，重启秒级就绪。
 
 ### 4. 在 ECS 上部署（最简：docker run）
 
-如果不想引入 compose，用单条 `docker run` 也行：
+如果不想引入 compose，用 `docker run` 直接跑也行。同样**先迁移再起业务**：
 
 ```bash
-docker pull registry.cn-hangzhou.aliyuncs.com/<ns>/ub-rag-core:0.1.0
+IMG=registry.cn-hangzhou.aliyuncs.com/<ns>/ub-rag-core:0.1.0
+DB_URL="postgresql+asyncpg://rag:<pwd>@pgm-xxx.pg.rds.aliyuncs.com:5432/rag"
 
+docker pull $IMG
+
+# Step 1: 一次性容器跑迁移（跑完即删）
+docker run --rm \
+  -e DATABASE_URL="$DB_URL" \
+  $IMG alembic upgrade head
+
+# Step 2: 起业务容器（无状态 worker）
 docker run -d --name ub-rag-core \
   --restart=always \
   -p 127.0.0.1:8000:8000 \
   -v /data/ub-rag-core/model-cache:/app/.model_cache \
   --memory=8g --cpus=4 \
-  -e DATABASE_URL="postgresql+asyncpg://rag:<pwd>@pgm-xxx.pg.rds.aliyuncs.com:5432/rag" \
+  -e DATABASE_URL="$DB_URL" \
   -e MODEL_CACHE_DIR=/app/.model_cache \
   -e HF_ENDPOINT=https://hf-mirror.com \
   -e DEVICE=cpu \
   -e USE_FP16=false \
-  -e RUN_MIGRATIONS=true \
-  registry.cn-hangzhou.aliyuncs.com/<ns>/ub-rag-core:0.1.0
+  -e WORKERS=1 \
+  -e RUN_MIGRATIONS=false \
+  $IMG
 ```
+
+> 把 `alembic upgrade head` 直接作为 `docker run` 的命令传入，会被入口识别为「一次性任务」，跳过启动应用、跑完直接退出。
 
 ### 5. SAE / ACK 提示
 
-- **SAE**：直接使用上面的 ACR 镜像；环境变量参考 `.env.prod.example`；建议挂载 NAS 作为模型缓存盘；CPU 4c8g 起步（BGE-M3 + Reranker 内存约 5–6GB）。
-- **ACK**：以 Deployment 跑容器；模型缓存用 PVC；建议加 `livenessProbe`/`readinessProbe` 指向 `/health`，模型加载较慢可把 `initialDelaySeconds` 调到 120s。镜像本身已带 `HEALTHCHECK`，但 K8s 会忽略 Dockerfile 里的 healthcheck，所以仍需在 manifest 里配探针。
+- **SAE**：直接使用上面的 ACR 镜像；环境变量参考 `.env.prod.example`，**`RUN_MIGRATIONS=false` 必须设**；建议挂载 NAS 作为模型缓存盘；CPU 4c8g 起步（BGE-M3 + Reranker 内存约 5–6GB）。迁移用「定时任务/Job」类型再启一个一次性容器执行 `alembic upgrade head`。
+- **ACK**：
+  - 业务用 Deployment（多副本无状态），`RUN_MIGRATIONS=false`
+  - 迁移用 Job，`command: ["alembic", "upgrade", "head"]`，部署流水线里安排在 Deployment rollout 之前
+  - 模型缓存用 PVC（多副本可 ReadOnlyMany 共享）
+  - 加 `livenessProbe`/`readinessProbe` 指向 `/health`；模型加载较慢，`initialDelaySeconds` 设 120s
+  - 镜像内置的 `HEALTHCHECK` 在 K8s 下被忽略，仍需在 manifest 里配探针
 
 ### 6. 安全组 / VPC / 网关提示
 

@@ -1,9 +1,29 @@
 #!/usr/bin/env bash
+# =============================================================================
+# 容器入口。两种使用方式：
+#
+# 1) 业务进程（默认）：
+#    docker run <image>                            # 用 WORKERS 控制并发
+#    docker run -e WORKERS=2 <image>
+#
+# 2) 一次性任务（不会启动应用，直接 exec 你给的命令然后退出）：
+#    docker run --rm <image> alembic upgrade head
+#    docker run --rm <image> alembic downgrade -1
+#    docker run --rm <image> python -m scripts.something
+#
+# 入口逻辑：
+#   - 始终等待 DATABASE_URL 可达（前提是设置了）
+#   - RUN_MIGRATIONS=true 时启动前自动跑一次迁移（默认 false，多副本场景请用方式 2）
+#   - 没有显式传命令 → 启动 uvicorn（用 WORKERS / HOST / PORT 环境变量）
+#   - 显式传命令 → 原样 exec
+# =============================================================================
 set -euo pipefail
 
-# Wait for the database to accept TCP connections.
+log() { echo "[entrypoint] $*"; }
+
+# ---------- 1. 等待数据库 ----------
 if [[ -n "${DATABASE_URL:-}" ]]; then
-  echo "[entrypoint] waiting for database to be reachable..."
+  log "waiting for database to be reachable..."
   python - <<'PY'
 import os
 import re
@@ -30,11 +50,32 @@ else:
 PY
 fi
 
-# Run migrations unless explicitly disabled.
-if [[ "${RUN_MIGRATIONS:-true}" == "true" ]]; then
-  echo "[entrypoint] running alembic upgrade head..."
-  alembic upgrade head
+# ---------- 2. 一次性任务模式 ----------
+# 如果调用方显式传了命令（compose run / docker run <image> CMD ARGS...），
+# 直接 exec，不启动应用、不跑自动迁移。
+# 判定规则：第一个参数不是 uvicorn / 不是空。
+if [[ $# -gt 0 && "$1" != "uvicorn" ]]; then
+  log "one-shot task: $*"
+  exec "$@"
 fi
 
-echo "[entrypoint] starting: $*"
-exec "$@"
+# ---------- 3. 业务进程模式 ----------
+# 可选自动迁移（默认关闭，避免多副本竞争）。
+if [[ "${RUN_MIGRATIONS:-false}" == "true" ]]; then
+  log "RUN_MIGRATIONS=true, running 'alembic upgrade head' before start..."
+  log "WARNING: don't enable this on multi-replica deployments. Run migrations as a separate one-shot task instead."
+  alembic upgrade head
+else
+  log "RUN_MIGRATIONS=false, skipping. Make sure migrations have been applied externally."
+fi
+
+# uvicorn 参数从环境变量读，默认单 worker。
+HOST="${HOST:-0.0.0.0}"
+PORT="${PORT:-8000}"
+WORKERS="${WORKERS:-1}"
+
+log "starting uvicorn: host=${HOST} port=${PORT} workers=${WORKERS}"
+exec uvicorn src.main:app \
+  --host "${HOST}" \
+  --port "${PORT}" \
+  --workers "${WORKERS}"

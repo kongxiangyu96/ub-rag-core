@@ -32,7 +32,11 @@ services:
       DEVICE: ${DEVICE:-cpu}
       USE_FP16: ${USE_FP16:-false}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      RUN_MIGRATIONS: ${RUN_MIGRATIONS:-true}
+      WORKERS: ${WORKERS:-1}
+      # 生产严禁打开（多副本场景会抢迁移）。请通过下面的一次性容器执行迁移：
+      #   docker compose -f docker-compose.prod.yml --env-file .env.prod \
+      #       run --rm app alembic upgrade head
+      RUN_MIGRATIONS: ${RUN_MIGRATIONS:-false}
       CHUNK_SIZE: ${CHUNK_SIZE:-512}
       CHUNK_OVERLAP: ${CHUNK_OVERLAP:-64}
       DEFAULT_TOP_K: ${DEFAULT_TOP_K:-20}

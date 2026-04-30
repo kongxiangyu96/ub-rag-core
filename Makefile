@@ -76,13 +76,17 @@ psql: ## 用 psql 进 pgvector 数据库
 	$(COMPOSE_DEV) exec db psql -U $${POSTGRES_USER:-rag} -d $${POSTGRES_DB:-rag}
 
 .PHONY: migrate
-migrate: ## 手动执行 alembic upgrade head
-	$(COMPOSE_DEV) exec app alembic upgrade head
+migrate: ## 一次性容器跑 alembic upgrade head（不需要 app 已经在跑）
+	$(COMPOSE_DEV) run --rm app alembic upgrade head
+
+.PHONY: migrate-status
+migrate-status: ## 查看当前迁移版本
+	$(COMPOSE_DEV) run --rm app alembic current
 
 .PHONY: makemigration
 makemigration: ## 生成新的 alembic 迁移：make makemigration MSG="add xxx"
 	@test -n "$(MSG)" || (echo "请通过 MSG=\"...\" 提供迁移说明" && exit 1)
-	$(COMPOSE_DEV) exec app alembic revision --autogenerate -m "$(MSG)"
+	$(COMPOSE_DEV) run --rm app alembic revision --autogenerate -m "$(MSG)"
 
 .PHONY: test
 test: ## 在 app 容器里跑 pytest
@@ -107,13 +111,24 @@ build-push: build push ## 构建并推送
 # -----------------------------------------------------------------------------
 # 生产部署（在已配置好 .env.prod 的机器上执行）
 # -----------------------------------------------------------------------------
-.PHONY: prod-up
-prod-up: ## 拉镜像 + 起 app（生产，连 RDS）
+.PHONY: prod-pull
+prod-pull: ## 拉取最新镜像
 	$(COMPOSE_PROD) pull
+
+.PHONY: prod-migrate
+prod-migrate: ## 在生产环境跑一次性迁移容器（推荐：部署前先调一次）
+	$(COMPOSE_PROD) run --rm app alembic upgrade head
+
+.PHONY: prod-migrate-status
+prod-migrate-status: ## 查看生产 DB 当前迁移版本
+	$(COMPOSE_PROD) run --rm app alembic current
+
+.PHONY: prod-up
+prod-up: ## 起生产业务容器（不会自动迁移，建议先跑 prod-migrate）
 	$(COMPOSE_PROD) up -d
 
 .PHONY: prod-down
-prod-down: ## 停掉生产 app
+prod-down: ## 停掉生产业务容器
 	$(COMPOSE_PROD) down
 
 .PHONY: prod-logs
@@ -121,8 +136,11 @@ prod-logs: ## 跟随生产 app 日志
 	$(COMPOSE_PROD) logs -f app
 
 .PHONY: prod-deploy
-prod-deploy: prod-up prod-logs ## 一键部署：pull + up + 跟日志
+prod-deploy: prod-pull prod-migrate prod-up ## 标准部署流程：pull → migrate（一次性）→ up
+	@echo ""
+	@echo "[make] 部署完成。用 'make prod-logs' 跟随日志确认 ready。"
 
-.PHONY: prod-migrate
-prod-migrate: ## 在生产容器里手动执行迁移
-	$(COMPOSE_PROD) exec app alembic upgrade head
+.PHONY: prod-shell
+prod-shell: ## 在生产环境起一次性容器跑任意命令：make prod-shell CMD="python -V"
+	@test -n "$(CMD)" || (echo "请通过 CMD=\"...\" 提供命令" && exit 1)
+	$(COMPOSE_PROD) run --rm app $(CMD)

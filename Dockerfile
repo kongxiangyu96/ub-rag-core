@@ -81,4 +81,8 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
 
 # 用 tini 做 PID 1，正确转发信号、回收僵尸进程
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/scripts/entrypoint.sh"]
-CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+# 默认启动业务进程（uvicorn）。worker 数 / host / port 由 entrypoint 读 WORKERS / HOST / PORT 环境变量决定。
+# 一次性任务请直接传命令覆盖，例如：
+#   docker run --rm <image> alembic upgrade head
+CMD []

@@ -50,6 +50,10 @@ services:
       DEVICE: ${DEVICE:-cpu}
       USE_FP16: ${USE_FP16:-false}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      WORKERS: ${WORKERS:-1}
+      # 本地单副本，方便起步：默认在容器启动时自动跑一次迁移。
+      # 生产多副本场景请关闭，并把迁移作为一次性任务执行：
+      #   docker compose run --rm app alembic upgrade head
       RUN_MIGRATIONS: ${RUN_MIGRATIONS:-true}
       CHUNK_SIZE: ${CHUNK_SIZE:-512}
       CHUNK_OVERLAP: ${CHUNK_OVERLAP:-64}
